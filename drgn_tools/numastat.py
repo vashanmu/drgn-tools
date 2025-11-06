@@ -89,7 +89,9 @@ def get_per_node_meminfo(prog: Program, node: Object) -> Dict[str, int]:
 
     totalram_pages = node_zone_stats["NR_MANAGED_PAGES"]
     freeram_pages = node_zone_stats["NR_FREE_PAGES"]
-    bounce_pages = node_zone_stats["NR_BOUNCE"]
+    # Since 194df9f66db8d ("mm: remove NR_BOUNCE zone stat") in v6.16, NR_BOUNCE
+    # is removed from stats and set to zero.
+    bounce_pages = node_zone_stats.get("NR_BOUNCE", 0)
     mlocked_pages = node_zone_stats["NR_MLOCK"]
 
     slab_reclaimable = node_zone_stats["NR_SLAB_RECLAIMABLE"]
@@ -149,7 +151,10 @@ def get_per_node_meminfo(prog: Program, node: Object) -> Dict[str, int]:
     if "NR_UNSTABLE_NFS" in node_zone_stats:
         mm_stats["NFS_Unstable"] = node_zone_stats["NR_UNSTABLE_NFS"]
     mm_stats["Bounce"] = bounce_pages
-    mm_stats["WritebackTmp"] = node_zone_stats["NR_WRITEBACK_TEMP"]
+    # Since commit 8356a5a3b078c ("mm, vmstat: remove the NR_WRITEBACK_TEMP
+    # node_stat_item counter") in 6.17, this element is removed and hardcoded
+    # zero.
+    mm_stats["WritebackTmp"] = node_zone_stats.get("NR_WRITEBACK_TEMP", 0)
 
     # Collect transparent hugepage meminfo.
     unit = mm_consts["TRANS_HPAGE_UNIT"]

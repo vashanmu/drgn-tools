@@ -21,21 +21,25 @@ from typing import Union
 import drgn
 from drgn import cast
 from drgn import container_of
+from drgn import FaultError
 from drgn import Object
 from drgn import PlatformFlags
 from drgn import Program
 from drgn.helpers.linux import for_each_online_cpu
 from drgn.helpers.linux import per_cpu
+from drgn.helpers.linux import xa_for_each
 from drgn.helpers.linux.list import hlist_for_each_entry
 from drgn.helpers.linux.list import list_empty
 from drgn.helpers.linux.list import list_for_each
 from drgn.helpers.linux.list import list_for_each_entry
 from drgn.helpers.linux.pid import find_task
+from drgn.helpers.linux.timekeeping import ktime_get_real_seconds
 
 from drgn_tools.corelens import CorelensModule
 from drgn_tools.module import ensure_debuginfo
 from drgn_tools.table import print_table
 from drgn_tools.table import Table
+from drgn_tools.util import redirectable
 
 # Golbal variables and definitions #
 
@@ -157,7 +161,7 @@ def get_connection_uptime(conn: Object) -> timedelta:
     :returns: Conn up time as a string
     """
     prog = conn.prog_
-    curr_time = prog["tk_core"].timekeeper.xtime_sec
+    curr_time = ktime_get_real_seconds(prog)
     conn_restart_time = conn.c_path.cp_reconnect_start
     time_since = curr_time - conn_restart_time
     return timedelta(seconds=int(time_since))
@@ -507,19 +511,16 @@ def ensure_mlx_core_ib_debuginfo(prog: drgn.Program, dev_name: str) -> bool:
 # RDS Corelens module functions #
 
 
+@redirectable
 def rds_dev_info(
     prog: drgn.Program,
     ret: bool = False,
-    outfile: Optional[str] = None,
-    report: bool = False,
 ) -> Optional[List[Object]]:
     """
     Print the IB device info
 
     :param prog: drgn program
     :param ret: If true the function returns the ``struct rds_ib_device`` list and None if the arg is false
-    :param outfile: A file to write the output to.
-    :param report: Open the file in append mode. Used to generate a report of all the functions in the rds module.
     :returns: A List of ``struct rds_ib_device`` or None
     """
 
@@ -563,7 +564,7 @@ def rds_dev_info(
             [index, rds_ib_device, ib_device, dev_name, node_name, ip_str]
         )
 
-    print_table(info, outfile, report)
+    print_table(info)
 
     if ret:
         return rds_ib_dev_list
@@ -571,19 +572,66 @@ def rds_dev_info(
         return None
 
 
-def rds_stats(
-    prog: drgn.Program,
-    fields: Optional[str] = None,
-    outfile: Optional[str] = None,
-    report: bool = False,
-) -> None:
+@redirectable
+def rdma_resource_usage(prog: Program) -> None:
+    """
+    Print RDMA restrack resource usage counts for ALL mlx5_* devices, similar to
+    'rdma res show'
+    """
+    dev_kset = prog["devices_kset"]
+    data = [["Index", "Device", "PD", "CQ", "QP", "CM_ID", "MR", "CTX", "SRQ"]]
+    index = 0
+    res_types_enum = prog.type("enum rdma_restrack_type")
+    for dev in list_for_each_entry(
+        "struct device", dev_kset.list.address_of_(), "kobj.entry"
+    ):
+        try:
+            name = dev.kobj.name.string_().decode()
+            ib_dev = container_of(dev, "struct ib_device", "dev")
+            dev_name = ib_dev.name.string_().decode()
+            if not dev_name.startswith("mlx"):
+                continue
+            counts = {}
+            for name, i in res_types_enum.enumerators:
+                res_name = name[len("RDMA_RESTRACK_") :].lower()
+                try:
+                    xa = ib_dev.res[i].xa
+                    counts[res_name] = sum(
+                        1 for _ in xa_for_each(xa.address_of_())
+                    )
+                except Exception:
+                    counts[res_name] = -1
+
+            def fmt(val):
+                return "NA" if val == -1 else str(val)
+
+            data.append(
+                [
+                    str(index),
+                    dev_name,
+                    fmt(counts["pd"]),
+                    fmt(counts["cq"]),
+                    fmt(counts["qp"]),
+                    fmt(counts["cm_id"]),
+                    fmt(counts["mr"]),
+                    fmt(counts["ctx"]),
+                    fmt(counts["srq"]),
+                ]
+            )
+            index += 1
+        except Exception:
+            continue
+
+    print_table(data)
+
+
+@redirectable
+def rds_stats(prog: drgn.Program, fields: Optional[str] = None) -> None:
     """
     Print the RDS stats and counters.
 
     :param prog: drgn program
     :param fields: List of comma separated fields to print. It also supports substring matching for the fields provided. Ex: 'conn_reset,  ib_tasklet_call, send, ...'
-    :param outfile: A file to write the output to.
-    :param report: Open the file in append mode. Used to generate a report of all the functions in the rds module.
     :returns: None
     """
     msg = ensure_debuginfo(prog, ["rds"])
@@ -600,9 +648,10 @@ def rds_stats(
     rds_stats.extend(rds_get_stats(prog, "rds_stats", fields_list))
     rds_stats.extend(rds_get_stats(prog, "rds_ib_stats", fields_list))
 
-    print_table(rds_stats, outfile, report)
+    print_table(rds_stats)
 
 
+@redirectable
 def rds_conn_info(
     prog: drgn.Program,
     laddr: Optional[str] = None,
@@ -610,8 +659,6 @@ def rds_conn_info(
     tos: Optional[str] = None,
     state: Optional[str] = None,
     ret: bool = False,
-    outfile: Optional[str] = None,
-    report: bool = False,
 ) -> Optional[List[Object]]:
     """
     Display all RDS connections
@@ -622,8 +669,6 @@ def rds_conn_info(
     :param tos: comma separated string list of TOS.  Ex: '0, 3, ...'
     :param state: comma separated string list of conn states. Ex 'RDS_CONN_UP, CONNECTING, ...'
     :param ret: If true the function returns the ``struct rds_ib_connection`` list and None if the arg is false
-    :param outfile: A file to write the output to.
-    :param report: Open the file in append mode. Used to generate a report of all the functions in the rds module.
     :returns: A List of ``struct rds_ib_connection`` that match the filters provided or None
     """
     msg = ensure_debuginfo(prog, ["rds"])
@@ -709,7 +754,7 @@ def rds_conn_info(
             ]
         )
 
-    print_table(conn_list, outfile, report)
+    print_table(conn_list)
 
     if ret:
         return ib_conn_list
@@ -804,6 +849,7 @@ def rds_ib_conn_ring_info(
     print_table(ring_info)
 
 
+@redirectable
 def rds_info_verbose(
     prog: drgn.Program,
     laddr: Optional[str] = None,
@@ -811,8 +857,6 @@ def rds_info_verbose(
     tos: Optional[str] = None,
     fields: Optional[str] = None,
     ret: bool = False,
-    outfile: Optional[str] = None,
-    report: bool = False,
 ) -> Optional[List[Object]]:
     """
     Print the rds conn stats similar to rds-info -Iv
@@ -823,8 +867,6 @@ def rds_info_verbose(
     :param tos: comma separated string list of TOS.  Ex: '0, 3, ...'
     :param fields: List of comma separated fields to display. It also supports substring matching for the fields provided.  Ex: 'Recv_alloc_ctr,  Cache Allocs, Tx, ...'
     :param ret: If true the function returns the ``struct rds_ib_connection`` list and None if the arg is false
-    :param outfile: A file to write the output to.
-    :param report: Open the file in append mode. Used to generate a report of all the functions in the rds module.
     :returns: A List of ``struct rds_ib_connection`` that match the filters provided or None
     """
     msg = ensure_debuginfo(prog, ["rds"])
@@ -843,6 +885,7 @@ def rds_info_verbose(
             "Tos",
             "SL",
             "SrcQPNo",
+            "SrcQPState",
             "DstQPNo",
             "Cache_allocs",
             "Recv_alloc_ctr",
@@ -863,6 +906,7 @@ def rds_info_verbose(
             "RCV IRQN",
         ]
     ]
+    qp_state_type = prog.type("enum ib_qp_state")
     for rds_ib_dev in for_each_rds_ib_device(prog):
         dev_name = rds_ib_dev.dev.name.string_().decode("utf-8")
         debuginfo = ensure_mlx_core_ib_debuginfo(prog, dev_name)
@@ -878,6 +922,14 @@ def rds_info_verbose(
                 dstqpnum: Any = int(con.i_dst_qp_num)
             except AttributeError:
                 dstqpnum = "N/A"
+            try:
+                ibqp = con.i_cm_id.qp
+                mlx5_srcqp = container_of(ibqp, "struct mlx5_ib_qp", "ibqp")
+                srcqpstate = str(cast(qp_state_type, mlx5_srcqp.state)).split(
+                    "_"
+                )[-1]
+            except FaultError:
+                srcqpstate = "N/A"
             sl = int(con.i_sl)
             cache_allocs = int(con.i_cache_allocs.counter)
             recv_free_ctr = int(con.i_recv_ring.w_free_ctr.counter)
@@ -995,6 +1047,7 @@ def rds_info_verbose(
                     conn_tos,
                     sl,
                     srcqpnum,
+                    srcqpstate,
                     dstqpnum,
                     cache_allocs,
                     recv_alloc_ctr,
@@ -1031,7 +1084,7 @@ def rds_info_verbose(
         for col in conn_info:
             del col[index]
 
-    print_table(conn_info, outfile, report)
+    print_table(conn_info)
 
     if ret:
         return ics
@@ -1039,19 +1092,85 @@ def rds_info_verbose(
         return None
 
 
+@redirectable
+def rds_conn_cq_eq_info(prog: drgn.Program) -> None:
+    """
+    Display CQ and EQ info per RDS IB connection in a table format
+    """
+    msg = ensure_debuginfo(prog, ["rds", "mlx5_core", "mlx5_ib"])
+    if msg:
+        print(msg)
+        return
+
+    table = Table(
+        [
+            "LocalAddr",
+            "RemoteAddr",
+            "SCQNo",
+            "SCQ_ptr",
+            "RCQNo",
+            "RCQ_ptr",
+            "SCQ_EQNo",
+            "SCQ_EQ_ptr",
+            "RCQ_EQNo",
+            "RCQ_EQ_ptr",
+        ],
+    )
+
+    for dev in for_each_rds_ib_device(prog):
+        for ib_conn in list_for_each_entry(
+            "struct rds_ib_connection", dev.conn_list.address_of_(), "ib_node"
+        ):
+            conn = ib_conn.conn
+
+            try:
+                src_ip = rds_inet_ntoa(conn.c_laddr)
+                dst_ip = rds_inet_ntoa(conn.c_faddr)
+
+                scq = ib_conn.i_scq
+                rcq = ib_conn.i_rcq
+                scq_no = int(ib_conn.i_scq_vector)
+                rcq_no = int(ib_conn.i_rcq_vector)
+
+                scq_parent = container_of(scq, "struct mlx5_ib_cq", "ibcq")
+                rcq_parent = container_of(rcq, "struct mlx5_ib_cq", "ibcq")
+
+                scq_eq_no = int(scq_parent.eq.eqn)
+                rcq_eq_no = int(rcq_parent.eq.eqn)
+                scq_eq_ptr = hex(scq_parent.eq.value_())
+                rcq_eq_ptr = hex(rcq_parent.eq.value_())
+                scq_ptr = hex(scq.value_())
+                rcq_ptr = hex(rcq.value_())
+            except Exception:
+                continue
+
+            table.row(
+                src_ip,
+                dst_ip,
+                scq_no,
+                scq_ptr,
+                rcq_no,
+                rcq_ptr,
+                scq_eq_no,
+                scq_eq_ptr,
+                rcq_eq_no,
+                rcq_eq_ptr,
+            )
+
+    print("\nRDS conn CQ/EQ info:")
+    table.write()
+
+
+@redirectable
 def rds_sock_info(
     prog: drgn.Program,
     ret: bool = False,
-    outfile: Optional[str] = None,
-    report: bool = False,
 ) -> Optional[List[Object]]:
     """
     Print the rds socket info similar to rds-tools -k
 
     :param prog: drgn program
     :param ret: If true the function returns the ``struct rds_sock`` list and None if the arg is false
-    :param outfile: A file to write the output to.
-    :param report: Open the file in append mode. Used to generate a report of all the functions in the rds module.
     :returns: A List of ``struct rds_sock`` or None
     """
     msg = ensure_debuginfo(prog, ["rds"])
@@ -1090,12 +1209,12 @@ def rds_sock_info(
             pid: Any = int(sock.rs_pid.value_())
             task = find_task(prog, pid)
             comm: Any = "".join(re.findall('"([^"]*)"', str(task.comm)))
-        except AttributeError:
+        except (AttributeError, FaultError):
             pid = "N/A"
             comm = "N/A"
         try:
             cong: Any = int(sock.rs_congested)
-        except AttributeError:
+        except (AttributeError, FaultError):
             cong = "N/A"
         send_buf = rds_sk_sndbuf(sock)
         recv_buf = rds_sk_rcvbuf(sock)
@@ -1124,7 +1243,7 @@ def rds_sock_info(
                 comm,
             ]
         )
-    print_table(fields, outfile, report)
+    print_table(fields)
 
     if ret:
         return sock_list
@@ -1132,6 +1251,7 @@ def rds_sock_info(
         return None
 
 
+@redirectable
 def rds_print_recv_msg_queue(
     prog: drgn.Program,
     laddr: Optional[str] = None,
@@ -1140,8 +1260,6 @@ def rds_print_recv_msg_queue(
     lport: Optional[str] = None,
     rport: Optional[str] = None,
     ret: Optional[bool] = False,
-    outfile: Optional[str] = None,
-    report: bool = False,
 ) -> None:
     """
     Print the rds recv msg queue similar rds-info -r
@@ -1152,8 +1270,6 @@ def rds_print_recv_msg_queue(
     :param tos: comma separated string list of TOS.  Ex: '0, 3, ...'
     :param lport: comma separated string list of lport.  Ex: 2259, 36554, ...'
     :param rport: comma separated string list of rport.  Ex: 2259, 36554, ...'
-    :param outfile: A file to write the output to.
-    :param report: Open the file in append mode. Used to generate a report of all the functions in the rds module.
     :returns: None
 
     """
@@ -1170,8 +1286,6 @@ def rds_print_recv_msg_queue(
             "Seq",
             "Bytes",
         ],
-        outfile=outfile,
-        report=report,
     )
 
     if laddr:
@@ -1229,6 +1343,7 @@ def rds_print_recv_msg_queue(
     return None
 
 
+@redirectable
 def rds_print_send_retrans_msg_queue(
     prog: drgn.Program,
     queue: str,
@@ -1238,8 +1353,6 @@ def rds_print_send_retrans_msg_queue(
     lport: Optional[str] = None,
     rport: Optional[str] = None,
     ret: Optional[bool] = False,
-    outfile: Optional[str] = None,
-    report: bool = False,
 ) -> None:
     """
     Print the rds send or retransmit msg queue similar rds-info -st
@@ -1251,8 +1364,6 @@ def rds_print_send_retrans_msg_queue(
     :param tos: comma separated string list of TOS.  Ex: '0, 3, ...'
     :param lport: comma separated string list of lport.  Ex: 2259, 36554, ...'
     :param rport: comma separated string list of rport.  Ex: 2259, 36554, ...'
-    :param outfile: A file to write the output to.
-    :param report: Open the file in append mode. Used to generate a report of all the functions in the rds module.
     :returns: None
 
     """
@@ -1268,8 +1379,6 @@ def rds_print_send_retrans_msg_queue(
             "Seq",
             "Bytes",
         ],
-        outfile=outfile,
-        report=report,
     )
 
     if laddr:
@@ -1340,6 +1449,7 @@ def rds_print_send_retrans_msg_queue(
     return None
 
 
+@redirectable
 def rds_print_msg_queue(
     prog: drgn.Program,
     queue: str = "All",
@@ -1349,8 +1459,6 @@ def rds_print_msg_queue(
     lport: Optional[str] = None,
     rport: Optional[str] = None,
     ret: Optional[bool] = False,
-    outfile: Optional[str] = None,
-    report: bool = False,
 ) -> None:
     """
     Print the rds msg queue similar rds-info -srt
@@ -1362,8 +1470,6 @@ def rds_print_msg_queue(
     :param tos: comma separated string list of TOS.  Ex: '0, 3, ...'
     :param lport: comma separated string list of lport.  Ex: 2259, 36554, ...'
     :param rport: comma separated string list of rport.  Ex: 2259, 36554, ...'
-    :param outfile: A file to write the output to.
-    :param report: Open the file in append mode. Used to generate a report of all the functions in the rds module.
     :returns: None
 
     """
@@ -1375,14 +1481,21 @@ def rds_print_msg_queue(
     queue = queue.lower()
     if queue not in ("all", "send", "snd", "retrans", "re", "recv", "rcv"):
         print(
-            f"Unknown queue type '{queue}'. Expected: all, send, retrans, or recv"
+            f"Unknown queue type '{queue}'. Expected: all, send, retrans, or recv",
         )
         return
     if queue in ("send", "snd", "all"):
         rds_print_send_retrans_msg_queue(
-            prog, "send", laddr, raddr, tos, lport, rport, ret, outfile, report
+            prog,
+            "send",
+            laddr,
+            raddr,
+            tos,
+            lport,
+            rport,
+            ret,
         )
-        print("\n")
+        print()
     if queue in ("retrans", "re", "all"):
         rds_print_send_retrans_msg_queue(
             prog,
@@ -1393,13 +1506,17 @@ def rds_print_msg_queue(
             lport,
             rport,
             ret,
-            outfile,
-            report,
         )
-        print("\n")
+        print()
     if queue in ("recv", "rcv", "all"):
         rds_print_recv_msg_queue(
-            prog, laddr, raddr, tos, lport, rport, ret, outfile, report
+            prog,
+            laddr,
+            raddr,
+            tos,
+            lport,
+            rport,
+            ret,
         )
 
 
@@ -1435,8 +1552,6 @@ def print_mr_list_head_info(
             "length",
             "pd",
         ],
-        outfile=None,
-        report=False,
     )
 
     for list_ptr in list_for_each(list_head.address_of_()):
@@ -1514,13 +1629,13 @@ def rds_get_mr_list_info(
     )
 
 
-def report(prog: drgn.Program, outfile: Optional[str] = None) -> None:
+@redirectable
+def report(prog: drgn.Program) -> None:
     """
     Generate a report of RDS related data.
     This functions runs all the functions in the module and saves the results to the output file provided.
 
     :param prog: drgn.Program
-    :param outfile: A file to write the output to.
     :returns: None
     """
     msg = ensure_debuginfo(prog, ["rds"])
@@ -1528,12 +1643,14 @@ def report(prog: drgn.Program, outfile: Optional[str] = None) -> None:
         print(msg)
         return None
 
-    rds_dev_info(prog, outfile=outfile, report=False)
-    rds_sock_info(prog, outfile=outfile, report=True)
-    rds_conn_info(prog, outfile=outfile, report=True)
-    rds_info_verbose(prog, outfile=outfile, report=True)
-    rds_stats(prog, outfile=outfile, report=True)
-    rds_print_msg_queue(prog, queue="All", outfile=outfile, report=True)
+    # rds_dev_info(prog)
+    # rdma_resource_usage(prog)
+    rds_sock_info(prog)
+    rds_conn_info(prog)
+    rds_info_verbose(prog)
+    rds_conn_cq_eq_info(prog)
+    rds_stats(prog)
+    rds_print_msg_queue(prog, queue="All")
 
 
 class Rds(CorelensModule):

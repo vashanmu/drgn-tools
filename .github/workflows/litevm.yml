@@ -19,7 +19,7 @@ jobs:
       - uses: actions/setup-python@v4
         name: Set up Python
         with:
-          python-version: '3.x'
+          python-version: '3.12'
       - name: Install pre-commit
         run: pip install pre-commit
       - name: Run pre-commit hooks
@@ -62,7 +62,7 @@ jobs:
       - name: Build and install drgn with CTF support
         run: |
           cd ..
-          git clone https://github.com/brenns10/drgn -b ctf_0.0.31
+          git clone https://github.com/brenns10/drgn -b ctf_0.0.33
           cd drgn
           ../drgn-tools/venv/bin/pip install .
       - name: Run tests

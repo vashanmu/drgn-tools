@@ -1,11 +1,15 @@
 # Copyright (c) 2023, Oracle and/or its affiliates.
 # Licensed under the Universal Permissive License v 1.0 as shown at https://oss.oracle.com/licenses/upl/
+import argparse
+import contextlib
+import logging
 import re
 import sys
 import time
 import typing as t
 from contextlib import contextmanager
 from enum import IntEnum
+from functools import wraps
 from urllib.error import HTTPError
 from urllib.request import Request
 from urllib.request import urlopen
@@ -201,14 +205,20 @@ def percpu_ref_sum(prog: Program, ref: Object) -> int:
     :param ref: ``struct percpu_ref``
     :returns: sum of the percpu reference count
     """
-    ptr = ref.percpu_count_ptr
-    atomic_count = ref.count if has_member(ref, "count") else ref.data.count
+    if has_member(ref, "data"):
+        if ref.data.value_() != 0:
+            atomic_count = ref.data.count
+        else:
+            return 0
+    else:
+        atomic_count = ref.count
     # Last two bits of ptr is uses as flags, not in percpu mode if any bit set.
     # PERCPU_COUNT_BIAS = (1LU << (BITS_PER_LONG - 1)) was set to counter
     # in percpu mode.
     bits_per_long = prog.type("long").size * 8
     PERCPU_COUNT_BIAS = 1 << (bits_per_long - 1)
     counter = atomic_count.counter & ~PERCPU_COUNT_BIAS
+    ptr = ref.percpu_count_ptr
     if ptr & 0x3 != 0 or ptr == 0:
         return int(counter)
     percpu = Object(prog, "unsigned long", address=ptr)
@@ -265,7 +275,7 @@ class SimpleProgress:
         self.notty_update_every = notty_update_every
         self.start_time = time.time()
         self.next_report = self.start_time
-        self.isatty = sys.stdout.isatty()
+        self.isatty = sys.stderr.isatty()
 
     def __enter__(self):
         self.start_time = time.time()
@@ -297,16 +307,21 @@ class SimpleProgress:
                 f"\033[1k\r{self.desc}: {pct}% @ {rstr} ({cbstr} / {tbstr})",
                 end="",
                 flush=True,
+                file=sys.stderr,
             )
             self.next_report = current_time + self.update_every
         else:
-            print(f"{self.desc}: {pct}% @ {rstr} ({cbstr} / {tbstr})")
+            print(
+                f"{self.desc}: {pct}% @ {rstr} ({cbstr} / {tbstr})",
+                file=sys.stderr,
+            )
             self.next_report = current_time + self.notty_update_every
 
     def complete(self):
-        self.print_report()
-        if self.isatty and not self.quiet:
-            print()
+        if not self.quiet:
+            self.print_report()
+            if self.isatty:
+                print()
 
 
 def head_file(url: str) -> bool:
@@ -323,11 +338,16 @@ def download_file(
     f: t.BinaryIO,
     quiet: bool = True,
     desc: str = "Downloading",
+    logger: t.Optional[logging.Logger] = None,
+    caller: t.Optional[str] = None,
 ) -> None:
     response = urlopen(url)
 
     if response.status >= 400:
         raise Exception(f"HTTP {response.status} while fetching {url}")
+
+    if logger:
+        logger.info("%sDownloading %s", caller, url)
 
     buf = bytearray(4096 * 4)
     total_bytes = int(response.headers.get("Content-Length", "0"))
@@ -528,3 +548,61 @@ def per_cpu_owner(name: str, val: Object) -> int:
             return cpu
 
     return -1
+
+
+class CommaList(argparse.Action):
+    """Action that allows specifying an option multiple times, with comma-separated values"""
+
+    def __init__(self, *args, element_type=str, **kwargs) -> None:
+        self.element_type = element_type
+        return super().__init__(*args, **kwargs)
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        value: t.Union[str, t.Sequence[t.Any], None],
+        option_string: t.Optional[str] = None,
+    ) -> None:
+        assert isinstance(value, str)
+        result = getattr(namespace, self.dest, []) or []
+        for element in value.split(","):
+            result.append(self.element_type(element))
+        setattr(namespace, self.dest, result)
+
+
+F = t.TypeVar("F", bound=t.Callable[..., t.Any])
+
+
+def redirectable(f: F) -> F:
+    """
+    A decorator which allows any function to be redirected to stdout
+
+    Any function wrapped with this decorator can be called with an optional
+    string parameter "outfile", which specifies a filename that can be used to
+    redirect stdout. By default, the filename is opened in write mode
+    (truncating any former contents). But an explicit mode ""
+    """
+
+    @wraps(f)
+    def inner(*args, **kwargs):
+        outfile = kwargs.pop("outfile", None)
+        mode = "w"
+        # :w or :a can be explicitly specified at the end of the filename
+        if outfile and outfile[-2:] == ":a":
+            outfile = outfile[:-2]
+            mode = "a"
+        elif outfile and outfile[-2:] == ":w":
+            mode = "w"
+            outfile = outfile[:-2]
+        with contextlib.ExitStack() as es:
+            # Optionally redirect stdout
+            if outfile:
+                es.enter_context(
+                    contextlib.redirect_stdout(
+                        es.enter_context(open(outfile, mode))
+                    )
+                )
+            return f(*args, **kwargs)
+
+    return t.cast(F, inner)
